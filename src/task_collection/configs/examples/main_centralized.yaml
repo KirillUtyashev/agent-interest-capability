@@ -1,0 +1,66 @@
+# Centralized width-8 baseline for the both-bounded main panel.
+# *_width fields are circular radii: breadth = min(2 * radius + 1, N).
+env:
+  height: 12
+  width: 12
+  n_agents: 21
+  n_task_types: 21
+  n_tasks: 9
+  max_tasks_per_type: 9
+  gamma: 0.99
+  relatedness_width: 5
+  proficiency_width: 5
+  stochastic:
+    spawn_prob: 0.16
+    despawn_mode: probability
+    despawn_prob: 0.1
+    spawn_on_agent_cells: true
+    spawn_at_round_end: true
+    sigma_a: 16.0
+    sigma_b: 0.0  # Ignored by the derived-variance reward generator.
+    reward_generation: circulant_derived_task_variance
+
+model:
+  encoder: everything_cnn_grid
+  conv_specs: [[8, 3], [8, 3]]
+  mlp_dims: [8]
+  activation: relu
+  weight_init: default
+
+train:
+  algorithm:
+    name: value
+  learning_type: centralized
+  use_gpu: false  # Set true for CUDA/vmap; CPU works without any cluster setup.
+  total_steps: 5000000
+  seed: 1234
+  td_lambda: 0.3
+  discount_method: round_steps
+  train_only_teammates: false
+  behavior_policy: value_greedy
+  heuristic: nearest
+  lr:
+    start: 0.000001
+    end: 0.000001
+    schedule: none
+  epsilon:
+    start: 0.05
+    end: 0.05
+    schedule: none
+  stopping:
+    condition: none
+
+eval:
+  eval_steps: 945
+  n_test_states: 50
+  eval_seed: null
+  rollout_metrics: true
+  checkpoint_freq: 1000000
+  final_eval_freq: 10000
+  final_eval_window: 1000000
+
+logging:
+  output_dir: outputs/examples/main_centralized
+  main_csv_freq: 50000
+  detail_csv_freq: 50000
+  timing_csv_freq: 50000

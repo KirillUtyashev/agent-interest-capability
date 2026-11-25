@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=77,<85"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "task-collection"
+version = "0.1.1"
+description = "Multi-agent task collection and decentralized after-state value learning"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "matplotlib==3.10.8",
+    "numpy==2.4.4",
+    "pandas==3.0.2",
+    "PyYAML==6.0.3",
+    "scipy==1.17.1",
+    "torch==2.11.0",
+]
+
+[project.optional-dependencies]
+cpu = ["torch==2.11.0"]
+cuda = ["torch==2.11.0", "nvidia-ml-py==13.595.45"]
+
+[project.scripts]
+task-collection-train = "task_collection.train:main"
+task-collection-reproduce = "task_collection.reproduce:main"
+
+[dependency-groups]
+dev = ["pytest==9.0.3"]
+
+[tool.uv]
+required-version = ">=0.12.24"
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+conflicts = [[{ extra = "cpu" }, { extra = "cuda" }]]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu126", extra = "cuda" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["task_collection", "task_collection.*"]
+exclude = ["task_collection.tests", "task_collection.tests.*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+task_collection = ["configs/reference.yaml", "configs/examples/*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["src/task_collection/tests", "tests"]
+pythonpath = ["src"]

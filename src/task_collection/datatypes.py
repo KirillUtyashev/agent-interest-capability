@@ -1,0 +1,235 @@
+"""Core types: Grid, State, Transition, EncoderOutput, and config dataclasses."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import NamedTuple
+
+import torch
+
+from task_collection.enums import (
+    Action,
+    Activation,
+    AlgorithmName,
+    DespawnMode,
+    EncoderType,
+    Heuristic,
+    LearningType,
+    Schedule,
+    StoppingCondition,
+    WeightInit,
+)
+
+
+# ---------------------------------------------------------------------------
+# Grid coordinate
+# ---------------------------------------------------------------------------
+class Grid(NamedTuple):
+    row: int
+    col: int
+
+
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class State:
+    agent_positions: tuple[Grid, ...]       # length = n_agents
+    task_positions: tuple[Grid, ...]        # sorted by (row, col)
+    actor: int                              # index of agent whose turn it is
+    task_types: tuple[int, ...] | None = None  # parallel to task_positions
+    # task_types[k] = type τ ∈ {0, ..., T-1} of the task at task_positions[k]
+    pick_phase: bool = False  # True = agent is on task, pick not yet resolved
+
+    def is_agent_on_task(self, agent_idx: int, my_types: frozenset[int] | None = None) -> bool:
+        """Check if agent is on a task cell.
+
+        my_types: if provided, only counts tasks whose type is in this set.
+        None means any task type.
+        """
+        pos = self.agent_positions[agent_idx]
+        if pos not in self.task_positions:
+            return False
+        if my_types is None:
+            return True
+        for tp, tt in zip(self.task_positions, self.task_types or ()):
+            if tp == pos and tt in my_types:
+                return True
+        return False
+
+    def task_type_at(self, pos: Grid) -> int | None:
+        """Type of task at pos. None if no task there."""
+        for i, tp in enumerate(self.task_positions):
+            if tp == pos:
+                return self.task_types[i] if self.task_types is not None else 0
+        return None
+
+    def tasks_at(self, pos: Grid) -> list[tuple[int, int]]:
+        """List of (task_index, type) at pos. For choice pick with multiple types."""
+        result = []
+        for i, tp in enumerate(self.task_positions):
+            if tp == pos:
+                t = self.task_types[i] if self.task_types is not None else 0
+                result.append((i, t))
+        return result
+
+    @property
+    def n_agents(self) -> int:
+        return len(self.agent_positions)
+
+    def with_pick_phase(self) -> State:
+        """Copy of this state with pick_phase=True (agent on task, pick pending)."""
+        return State(
+            agent_positions=self.agent_positions,
+            task_positions=self.task_positions,
+            actor=self.actor,
+            task_types=self.task_types,
+            pick_phase=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Parallel array helper
+# ---------------------------------------------------------------------------
+def sort_tasks(
+    positions: tuple[Grid, ...] | list[Grid],
+    types: tuple[int, ...] | list[int] | None = None,
+) -> tuple[tuple[Grid, ...], tuple[int, ...] | None]:
+    """Sort tasks by (row, col), reordering types array consistently."""
+    if not positions:
+        return (), types if types is None else ()
+    order = sorted(range(len(positions)), key=lambda i: (positions[i].row, positions[i].col))
+    sorted_pos = tuple(positions[i] for i in order)
+    sorted_types = tuple(types[i] for i in order) if types is not None else None
+    return sorted_pos, sorted_types
+
+
+# ---------------------------------------------------------------------------
+# Encoder output
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class EncoderOutput:
+    """Output of an encoder. Supports batching: scalar/grid may have batch dim."""
+    scalar: torch.Tensor | None = None     # shape: (D,) or (B, D)
+    grid: torch.Tensor | None = None       # shape: (C, H, W) or (B, C, H, W)
+
+
+# ---------------------------------------------------------------------------
+# Transition
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class Transition:
+    s_t: State
+    action: Action
+    s_t_after: State
+    s_t_next: State
+    rewards: tuple[float, ...]  # r_{t+1} for each agent; length = n_agents
+    discount: float             # γ_{t+1} for this transition
+
+
+# ---------------------------------------------------------------------------
+# Config dataclasses
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class StochasticConfig:
+    spawn_prob: float           # per empty cell per type per turn
+    despawn_mode: DespawnMode
+    despawn_prob: float         # only meaningful if despawn_mode == PROBABILITY
+    sigma_a: float = 0.0        # std of agent-variance component within a task category
+    sigma_b: float = 0.0        # std of baseline reward across task categories
+    reward_generation: str = "independent"  # independent, fixed-total Fourier, or derived-total Fourier
+    spawn_on_agent_cells: bool = False
+    spawn_at_round_end: bool = False
+
+
+@dataclass(frozen=True)
+class EnvConfig:
+    height: int
+    width: int
+    n_agents: int
+    n_tasks: int                    # initial tasks per type
+    gamma: float
+    n_task_types: int = 1
+    relatedness_width: int = 0       # w_R: R(i,j) = 1[|i-j| <= w_R]
+    proficiency_width: int = 0      # w_P: proficiency(i,kappa) = 1[|i-kappa| <= w_P]
+    max_tasks_per_type: int = 3
+    stochastic: StochasticConfig | None = None
+
+
+@dataclass(frozen=True)
+class ScheduleConfig:
+    start: float
+    end: float
+    schedule: Schedule = Schedule.NONE
+    step_size: int = 0
+    step_factor: float = 1.0
+    step_start: int = 0
+
+
+@dataclass(frozen=True)
+class StoppingConfig:
+    condition: StoppingCondition = StoppingCondition.NONE
+    patience_steps: int = 10000
+    improvement_threshold: float = 0.01
+    min_steps_before_stop: int = 0
+
+
+@dataclass(frozen=True)
+class AlgorithmConfig:
+    name: AlgorithmName = AlgorithmName.VALUE
+
+
+@dataclass(frozen=True)
+class TrainConfig:
+    total_steps: int
+    seed: int
+    lr: ScheduleConfig
+    epsilon: ScheduleConfig
+    algorithm: AlgorithmConfig = AlgorithmConfig()
+    learning_type: LearningType = LearningType.DECENTRALIZED
+    use_gpu: bool = True
+    td_lambda: float = 0.0
+    heuristic: Heuristic = Heuristic.NEAREST
+    stopping: StoppingConfig = StoppingConfig()
+    train_only_teammates: bool = False  # train only agents j where R(actor,j) > 0
+    discount_method: str = "team_steps"
+    behavior_policy: str = "value_greedy"  # value_greedy or heuristic
+
+
+@dataclass(frozen=True)
+class ModelConfig:
+    encoder: EncoderType
+    mlp_dims: tuple[int, ...]
+    conv_specs: tuple[tuple[int, int], ...] | None = None
+    activation: Activation = Activation.LEAKY_RELU
+    weight_init: WeightInit = WeightInit.ZERO_BIAS
+
+
+@dataclass(frozen=True)
+class EvalConfig:
+    eval_steps: int = 1000
+    n_test_states: int = 50
+    checkpoint_freq: int = 0
+    final_eval_freq: int = 0
+    final_eval_window: int = 0
+    eval_seed: int | None = None
+    mc_validation_path: str | None = None
+    rollout_metrics: bool = True
+
+
+@dataclass(frozen=True)
+class LoggingConfig:
+    output_dir: str = "runs/"
+    main_csv_freq: int = 10000
+    detail_csv_freq: int = 50000
+    timing_csv_freq: int = 0
+    env_trace: bool = False
+
+
+@dataclass(frozen=True)
+class ExperimentConfig:
+    env: EnvConfig
+    model: ModelConfig
+    train: TrainConfig
+    eval: EvalConfig
+    logging: LoggingConfig

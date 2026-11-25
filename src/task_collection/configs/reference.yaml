@@ -1,0 +1,162 @@
+# ============================================================================
+# Task Collection Config Reference
+# ============================================================================
+# Every field explained. Copy this and modify for your experiments.
+
+env:
+  height: 9                        # grid rows
+  width: 9                         # grid columns
+  n_agents: 4                      # total agents N
+  n_task_types: 4                  # T: number of distinct task types (must equal N: shared id space)
+  n_tasks: 10                      # initial tasks spawned per type at env.init_state()
+  max_tasks_per_type: 10           # cap: spawning stops when this many of type τ exist
+  gamma: 0.99                      # discount factor for move turns (pick turns use γ=1)
+
+  # Reward structure (proficiency/relatedness framework):
+  #
+  #   R[i,j] = 1[ |i - j| <= relatedness_width ]
+  #     — who shares reward with whom. relatedness_width=0: each agent rewards only itself.
+  #       relatedness_width=N-1: all agents share each other's rewards.
+  #
+  #   proficiency[i,κ] = 1[ |i - κ| <= proficiency_width ]
+  #     — which task types agent i can profitably pick. proficiency_width=0: agent i
+  #       can only pick type i (mod T). proficiency_width=T-1: any agent can pick any type.
+  #
+  #   category_rewards r'[κ,j]: stochastic T×N reward matrix, sampled once at env
+  #     construction from Normal(1, sigma_b²) + agent noise Normal(0, sigma_a²).
+  #     sigma_a=sigma_b=0 → r'[κ,j]=1 for all κ,j (homogeneous rewards).
+  #
+  #   Pick reward formula: r_j = proficiency[actor,κ] * R[actor,j] * r'[κ,j]
+  #
+  relatedness_width: 0             # w_R: reward-sharing radius; 0 = no sharing
+  proficiency_width: 0             # w_P: task-type eligibility radius; 0 = strict assignment
+
+  # Stochastic spawning/despawning (required):
+  stochastic:
+    spawn_prob: 0.01               # probability per empty cell per type per turn
+    despawn_prob: 0.0125           # probability each existing task despawns per turn
+    despawn_mode: probability      # "probability" or "none"
+    spawn_on_agent_cells: false    # if true, agents do not block task spawning
+    spawn_at_round_end: false      # if true, spawn/despawn only fires after the last agent acts
+    sigma_a: 0.0                   # agent-level noise in category_rewards (Normal std)
+    sigma_b: 0.0                   # category-level baseline noise in category_rewards (Normal std)
+    # "circulant_all_to_all" uses two deterministic Fourier cycles for task
+    # totals at every ring size. "circulant_scaled_frequency" scales the cycle
+    # count with the number of agents to preserve adjacent-task correlation.
+    # "circulant_derived_task_variance" keeps the scaled-frequency Fourier
+    # construction but derives task-total variance as g * sigma_a^2, where g
+    # is the number of interested agents; configured sigma_b is ignored. All
+    # circulant modes mask rewards to
+    # each task's circular caring group and may produce negatives.
+    reward_generation: independent # independent | circulant_all_to_all | circulant_scaled_frequency | circulant_derived_task_variance
+
+model:
+  # Encoder: how the grid state is converted to neural network input.
+  # Both encoders use raw binary positions only — no pre-calculated phi, R, or
+  # reward values appear anywhere; agents discover structure from the team reward.
+  #
+  #   everything_cnn_grid:   full unmasked view. Compatible with both centralized
+  #                          and decentralized learning (n_networks derived from
+  #                          train.learning_type). Grid: T+N+1 channels. Scalars: N+1.
+  #
+  #   filtered_dec_cnn_grid: decentralized only. Network i sees only the tasks it
+  #                          cares about (R_i, |R_i|=2*relatedness_width+1) and the
+  #                          agents within reach (W_i, |W_i|=2*(relatedness_width+
+  #                          proficiency_width)+1, capped at N), on the shared id
+  #                          ring (requires T=N). Grid: |R_i|+|W_i|+1 channels.
+  #                          Scalars: |W_i|+1.
+  encoder: everything_cnn_grid
+
+  # CNN architecture: list of [output_channels, kernel_size] per conv layer
+  # Padding is always kernel_size // 2 (same-padding), so spatial dims don't shrink
+  conv_specs: [[16, 3]]
+
+  # MLP hidden dims after conv flatten + scalar concat
+  # [] means no hidden layers (conv output → linear → 1)
+  # [16] means one hidden layer with 16 units
+  # [64, 64] means two hidden layers
+  mlp_dims: [16]
+
+  # Activation function: leaky_relu or relu or none
+  activation: leaky_relu
+
+  # Weight initialization: zero_bias zeros all bias terms; default leaves pytorch defaults
+  weight_init: zero_bias
+
+train:
+  # Learning type determines number of networks:
+  #   decentralized: N networks, one per agent (agent i's network only sees agent i's encoding)
+  #   centralized: 1 network shared by all agents (sees full state)
+  learning_type: decentralized
+
+  # Device: true=GPU (BatchedTrainer + vmap), false=CPU (sequential forwards)
+  use_gpu: false
+
+  # TD(λ) eligibility trace decay. 0=TD(0), 1=Monte Carlo-ish.
+  td_lambda: 0.3
+
+  total_steps: 10000000            # maximum training steps (may stop early)
+  seed: 1234                       # RNG seed for reproducibility
+
+  # Heuristic policy used for eval comparison and, when behavior_policy=heuristic,
+  # for fixed-policy TD data collection. Options include nearest and hungarian.
+  heuristic: nearest
+
+  # Data-collection policy for value learning:
+  #   value_greedy: epsilon-greedy wrt the learned value estimates (original behavior)
+  #   heuristic: deterministic train.heuristic policy, e.g. heuristic=hungarian
+  behavior_policy: value_greedy
+
+  # Discount timing method:
+  #   team_steps:  γ applied every step an agent acts (own steps only). Default for dec.
+  #   round_steps: γ applied once per full N-agent round (first step of each cycle).
+  #                Required for centralized, and for train_only_teammates=true with
+  #                multiple teams (ensures cen = Σ dec over round boundaries).
+  discount_method: team_steps
+
+  # If true, only update network j when R(actor, j) > 0 (env.teammate_mask).
+  # Each team maintains its own TD prev-state so stranger steps don't corrupt the trace.
+  # Pair with discount_method: round_steps when using multiple teams.
+  train_only_teammates: false
+
+  # Learning rate schedule for SGD
+  lr:
+    start: 9e-3                    # initial (and constant if schedule=none)
+    end: 9e-3                      # final value (only used if schedule=linear)
+    schedule: none                 # none=constant, linear=decay from start to end
+    # step_size: 0                 # for schedule=step: decay every N steps
+    # step_factor: 1.0             # for schedule=step: multiply by this factor
+    # step_start: 0                # for schedule=step: start stepping after this step
+
+  # Epsilon-greedy exploration rate
+  epsilon:
+    start: 0.05                    # initial exploration rate
+    end: 0.05                      # final (only used if schedule=linear)
+    schedule: none                 # none=constant, linear=decay
+
+  # Training algorithm:
+  #   value: current after-state value learning
+  algorithm:
+    name: value
+
+  # Early stopping: stop training if metric doesn't improve
+  stopping:
+    condition: running_max_rps     # "running_max_rps" or "none"
+    patience_steps: 1000000        # stop after this many steps without improvement
+    improvement_threshold: 1e-7    # minimum improvement to count as "better"
+    min_steps_before_stop: 3000000 # never stop before this many steps
+
+eval:
+  eval_steps: 1000                 # steps per eval rollout (greedy + heuristic)
+  rollout_metrics: true            # false skips rollout RPS and only logs non-rollout evals
+  n_test_states: 50                # number of states for value diagnostics
+  checkpoint_freq: 100000          # save model every N steps (0=final only)
+  final_eval_freq: 10000            # eval frequency strictly within the final window (0=disable)
+  final_eval_window: 1000000        # final number of training steps using final_eval_freq
+  mc_validation_path: null         # optional MC after-state CSV for value RMSE/MAE/bias eval
+
+logging:
+  output_dir: output/runs/         # base directory; timestamped subfolder created
+  main_csv_freq: 50000             # regular eval + metrics.csv frequency
+  detail_csv_freq: 50000           # write details.csv (weight norms, etc.) every N steps
+  timing_csv_freq: 10000           # write timing.csv every N steps (0=disable)

@@ -1,0 +1,303 @@
+"""Batched GPU training for N decentralized networks using vmap.
+
+Stacks all N networks' parameters and eligibility traces into (N, *shape)
+tensors on GPU. Uses torch.func.vmap + grad_and_value + functional_call to
+execute all N forward+backward passes in one parallel kernel launch.
+
+The algorithm is IDENTICAL to ValueNetwork.td_step — same TD(λ)
+backward view, same eligibility traces, same manual SGD. Only the execution
+strategy changes: N sequential CPU calls → 1 batched GPU call.
+"""
+
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+
+from torch.func import functional_call, grad, grad_and_value, stack_module_state, vmap
+
+from task_collection.datatypes import EncoderOutput
+from task_collection.model import ValueNetwork
+from task_collection.trainer.timer import Timer, TimerSection
+
+
+def _to_device_preserving_leading_broadcast(
+    tensor: torch.Tensor, device: torch.device,
+) -> torch.Tensor:
+    """Move a tensor without materializing a stride-zero leading dimension.
+
+    EverythingEncoder returns one observation broadcast across all networks.
+    A normal cross-device copy may expand that view into N physical copies.
+    Copying the single backing slice first and expanding on the destination
+    retains the exact values while reducing host allocation and transfer size.
+    """
+    if tensor.device == device:
+        return tensor
+    if tensor.ndim > 0 and tensor.shape[0] > 1 and tensor.stride(0) == 0:
+        base = tensor[0].to(device)
+        return base.unsqueeze(0).expand(tensor.shape)
+    return tensor.to(device)
+
+
+class _VmapForwardWrapper(nn.Module):
+    """Pure-function wrapper for functional_call compatibility.
+
+    Takes (grid, scalar) as raw tensors. Delegates to ValueNetwork.forward_raw
+    so the forward logic is defined in exactly one place.
+    """
+
+    def __init__(self, base_net: ValueNetwork) -> None:
+        super().__init__()
+        self.conv = base_net.conv
+        self.flatten = base_net.flatten
+        self.net = base_net.net
+
+    def forward(self, grid: torch.Tensor, scalar: torch.Tensor) -> torch.Tensor:
+        return ValueNetwork.forward_raw(self, grid, scalar)
+
+
+class BatchedTrainer:
+    """Batched GPU training for N decentralized TD(λ) networks.
+
+    Lifecycle:
+        1. __init__: stacks params + traces, moves to device.
+        2. td_lambda_step_batched(): one batched training step.
+        3. forward_batched(): batched no-grad inference (action selection).
+        4. reset_traces(): zero traces + gamma_prev at episode boundaries.
+        5. sync_to_networks(): push params back to CPU networks (for eval/ckpt).
+    """
+
+    def __init__(
+        self,
+        networks: list[ValueNetwork],
+        td_lambda: float,
+        device: str = "cuda",
+        timer: Timer | None = None,
+    ) -> None:
+        self.n = len(networks)
+        self.networks = networks
+        self._td_lambda = td_lambda
+        self.device = torch.device(device)
+        self._timer = timer or Timer()
+
+        # Create wrapper modules with identical structure
+        wrappers = [_VmapForwardWrapper(net) for net in networks]
+
+        # Stack params from all N wrappers ON CPU first: {name: (N, *shape)}
+        params, buffers = stack_module_state(wrappers)
+
+        # Now create base on device (deepcopy to avoid sharing params with networks)
+        import copy
+        self._base = copy.deepcopy(wrappers[0]).to(self.device)
+
+        # Move stacked params to device
+        self._params = {k: v.to(self.device).detach() for k, v in params.items()}
+        self._buffers = {k: v.to(self.device).detach() for k, v in buffers.items()}
+
+        # Eligibility traces: same structure, initialized to zero
+        self._traces = {k: torch.zeros_like(v) for k, v in self._params.items()}
+
+        # Per-network gamma_prev (all start at 0.0)
+        self._gamma_prev = torch.zeros(self.n, device=self.device)
+        self._agent_index_cache: dict[tuple[int, ...], torch.Tensor] = {}
+
+        # Pre-compute broadcast shapes for trace/param updates.
+        # Each param is (N, *shape); gamma_prev/deltas are (N,).
+        # We need to reshape them to (N, 1, 1, ...) to broadcast over *shape.
+        self._param_view_shapes = {
+            k: (-1,) + (1,) * (v.dim() - 1)
+            for k, v in self._params.items()
+        }
+
+        def _f(params, buffers, grid, scalar):
+            return functional_call(self._base, (params, buffers), (grid, scalar))
+
+        # Stacked forward: grids_pair is (2, C, H, W), returns (2,).
+        # grad(has_aux=True) differentiates out[0]=V(s_t) and returns out[1]=V(s_next)
+        # as aux — so one vmap call replaces the old grad_and_value + separate v_next forward.
+        def _f_stacked(params, buffers, grids_pair, scalars_pair):
+            out = functional_call(self._base, (params, buffers), (grids_pair, scalars_pair))
+            return out[0], (out[0], out[1])  # (V(s_t) for grad, (V(s_t), V(s_next)) as aux)
+
+        self._vmap_grad_with_vnext = vmap(grad(_f_stacked, has_aux=True))
+        self._vmap_forward = vmap(_f)  # used for action selection
+
+    # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
+    def td_lambda_step_batched(
+        self,
+        grids_t: torch.Tensor,       # (N, C, H, W) — s_t encodings
+        scalars_t: torch.Tensor,      # (N, S)
+        rewards: torch.Tensor,        # (N,)
+        discount: float,              # scalar, shared across agents
+        grids_next: torch.Tensor,     # (N, C, H, W) — s_{t+1} encodings
+        scalars_next: torch.Tensor,   # (N, S)
+        alpha: float,
+        agent_indices: list[int] | None = None,  # None = train all N; else only these K agents
+        defer_loss_sync: bool = False,
+    ) -> float | torch.Tensor:
+        """One batched TD(λ) backward-view step for all N (or K active) networks.
+
+        z ← γ_prev · λ · z + ∇V(s)
+        δ = r + γ · V(s') − V(s)
+        θ ← θ + α · δ · z
+
+        Returns sum of squared TD errors (for loss logging).
+        """
+        # Move inputs to device
+        grids_t = _to_device_preserving_leading_broadcast(grids_t, self.device)
+        scalars_t = _to_device_preserving_leading_broadcast(scalars_t, self.device)
+        rewards = rewards.to(self.device)
+        grids_next = _to_device_preserving_leading_broadcast(grids_next, self.device)
+        scalars_next = _to_device_preserving_leading_broadcast(scalars_next, self.device)
+
+        # When only a subset of agents should be trained, gather their data and
+        # run vmap over K agents only. Stranger agents are never touched.
+        if agent_indices is not None:
+            index_key = tuple(agent_indices)
+            idx = self._agent_index_cache.get(index_key)
+            if idx is None:
+                idx = torch.tensor(
+                    index_key, device=self.device, dtype=torch.long,
+                )
+                self._agent_index_cache[index_key] = idx
+            active_params  = {k: v[idx] for k, v in self._params.items()}
+            active_buffers = {k: v[idx] for k, v in self._buffers.items()}
+            active_gp      = self._gamma_prev[idx]
+            grids_t     = grids_t[idx]
+            scalars_t   = scalars_t[idx]
+            rewards     = rewards[idx]
+            grids_next  = grids_next[idx]
+            scalars_next = scalars_next[idx]
+        else:
+            idx            = None
+            active_params  = self._params
+            active_buffers = self._buffers
+            active_gp      = self._gamma_prev
+
+        # Single vmap call: grad of V(s_t) + V(s_t) + V(s_next) via stacked forward.
+        self._timer.start(TimerSection.TRAIN_GRAD)
+        grids_pair   = torch.stack([grids_t,   grids_next],   dim=1)  # (K, 2, C, H, W)
+        scalars_pair = torch.stack([scalars_t, scalars_next], dim=1)  # (K, 2, S)
+        grads, (v_s, v_next) = self._vmap_grad_with_vnext(
+            active_params, active_buffers, grids_pair, scalars_pair
+        )
+        self._timer.stop()
+
+        # z ← γ_prev · λ · z + ∇V(s)
+        self._timer.start(TimerSection.TRAIN_TRACE)
+        for name in active_params:
+            gp = active_gp.view(self._param_view_shapes[name])
+            if idx is not None:
+                trace_k = self._traces[name][idx] * (gp * self._td_lambda) + grads[name]
+                self._traces[name][idx] = trace_k
+            else:
+                self._traces[name].mul_(gp * self._td_lambda).add_(grads[name])
+        self._timer.stop()
+
+        # δ = r + γ · V(s') − V(s)
+        deltas = rewards + discount * v_next - v_s.detach()
+
+        # θ ← θ + α · δ · z
+        self._timer.start(TimerSection.TRAIN_PARAM)
+        with torch.no_grad():
+            for name in active_params:
+                d = deltas.view(self._param_view_shapes[name])
+                if idx is not None:
+                    self._params[name][idx] = self._params[name][idx] + alpha * self._traces[name][idx] * d
+                else:
+                    self._params[name].add_(self._traces[name] * d, alpha=alpha)
+        self._timer.stop()
+
+        if idx is not None:
+            self._gamma_prev[idx] = discount
+        else:
+            self._gamma_prev.fill_(discount)
+        loss = (deltas.detach() ** 2).sum()
+        return loss if defer_loss_sync else loss.item()
+
+    # ------------------------------------------------------------------
+    # Inference (action selection)
+    # ------------------------------------------------------------------
+    def forward_batched(
+        self,
+        grids: torch.Tensor,    # (N, B, C, H, W) — B after-states per network
+        scalars: torch.Tensor,  # (N, B, S)
+    ) -> torch.Tensor:
+        """Batched no-grad forward for action selection.
+
+        Uses vmap over N networks, each processing B states via standard
+        batched conv/linear ops. No Python loop over N.
+
+        Args:
+            grids:   (N, B, C, H, W) — N networks, B candidate after-states each
+            scalars: (N, B, S)
+        Returns:
+            values:  (N, B)
+        """
+        grids = _to_device_preserving_leading_broadcast(grids, self.device)
+        scalars = _to_device_preserving_leading_broadcast(scalars, self.device)
+
+        with torch.no_grad():
+            # The vmap transform is shape-polymorphic over the per-network input:
+            # it handles both a single state and a batch of B candidate states.
+            # Reuse the transform built at initialization instead of recreating
+            # the closure and vmap wrapper for every action decision.
+            return self._vmap_forward(
+                self._params, self._buffers, grids, scalars,
+            )  # (N, B)
+
+    def forward_single_batched(
+        self,
+        grids: torch.Tensor,    # (N, C, H, W) — one state per network
+        scalars: torch.Tensor,  # (N, S)
+    ) -> torch.Tensor:
+        """Batched no-grad forward, one input per network. Returns (N,)."""
+        grids = _to_device_preserving_leading_broadcast(grids, self.device)
+        scalars = _to_device_preserving_leading_broadcast(scalars, self.device)
+        with torch.no_grad():
+            return self._vmap_forward(self._params, self._buffers, grids, scalars)
+
+    # ------------------------------------------------------------------
+    # Trace management
+    # ------------------------------------------------------------------
+    def reset_traces(self) -> None:
+        """Zero all eligibility traces and gamma_prev. Call at episode/reset."""
+        for name in self._traces:
+            self._traces[name].zero_()
+        self._gamma_prev.zero_()
+
+    # ------------------------------------------------------------------
+    # Sync with individual networks
+    # ------------------------------------------------------------------
+    def sync_to_networks(self) -> None:
+        """Push stacked GPU params back to individual CPU networks.
+
+        Call before eval, checkpointing, or any code that reads
+        individual network weights.
+        """
+        for i, net in enumerate(self.networks):
+            # Extract this network's params from stacked tensors
+            net_params = {k: v[i].detach().cpu() for k, v in self._params.items()}
+            # The wrapper has same submodule structure as ValueNetwork (conv, net)
+            # so param names match: conv.0.weight, conv.0.bias, net.0.weight, etc.
+            conv_sd = {}
+            net_sd = {}
+            for k, v in net_params.items():
+                if k.startswith("conv."):
+                    conv_sd[k[len("conv."):]] = v
+                elif k.startswith("net."):
+                    net_sd[k[len("net."):]] = v
+            net.conv.load_state_dict(conv_sd)
+            net.net.load_state_dict(net_sd)
+
+    def sync_from_networks(self) -> None:
+        """Pull params from individual CPU networks to stacked GPU tensors.
+
+        Call after loading a checkpoint or externally modifying network weights.
+        """
+        wrappers = [_VmapForwardWrapper(net) for net in self.networks]
+        params, buffers = stack_module_state(wrappers)
+        self._params = {k: v.to(self.device).detach() for k, v in params.items()}
+        self._buffers = {k: v.to(self.device).detach() for k, v in buffers.items()}

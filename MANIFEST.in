@@ -1,0 +1,10 @@
+include README.md pyproject.toml uv.lock .python-version MANIFEST.in
+include scripts/check_distribution.py
+include scripts/normalize_distribution.py
+recursive-include docs *.md
+recursive-include src/task_collection *.py
+include src/task_collection/configs/reference.yaml
+recursive-include src/task_collection/configs/examples *.yaml
+recursive-include tests *.py
+global-exclude *.ipynb *.pt *.pth *.pkl *.npz *.png *.jpg *.jpeg *.pdf *.csv *.log *.pyc
+global-exclude .DS_Store
