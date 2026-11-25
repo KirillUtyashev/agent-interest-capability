@@ -1,7 +1,8 @@
 # Reproducing the paper's experiments
 
-Start with the repository [README](../README.md) for installation, metric
-definitions, baseline evaluation, checkpoint continuation, and scoring commands.
+Start with the repository [README](../README.md) for installation and a quick
+start. The [usage guide](usage.md) covers metric definitions, baseline evaluation,
+checkpoint continuation, and scoring commands.
 This page documents how to run the three experiment families from the paper
 using the code and example configurations in this repository.
 
